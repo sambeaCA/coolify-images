@@ -1,0 +1,137 @@
+# Apache Spark 3.5 Standalone (official image) — Coolify Docker Compose
+# Usage:
+#   Local:   docker compose -f spark.yml up -d
+#   Coolify: paste; UI exposes Master Web UI via SERVICE_FQDN_SPARKMASTER_8080.
+#
+# Topology: 1 master + 2 workers + history server.
+# Submit jobs from another container with:
+#   spark-submit --master spark://spark-master:7077 ...
+#
+# Sized for homelab host: i9-9900K (8c/16t), 32GB RAM.
+# 2 workers × 4 cores / 6GB = 8 cores / 12GB total for Spark.
+# Leaves ~8 cores / 20GB for Airflow + Kafka + Postgres + OS headroom.
+#
+# Why apache/spark instead of bitnami/spark:
+#   Bitnami images were removed from Docker Hub in 2025 (paid catalog migration).
+#   apache/spark is the official upstream image with long-term support.
+#   Trade-off: no SPARK_MODE env shorthand — start scripts run via spark-class.
+
+x-common: &common
+  restart: unless-stopped
+
+services:
+  # ──────────────────────────────────────────────
+  # Master — coordinates workers, exposes Web UI on 8080, RPC on 7077
+  # ──────────────────────────────────────────────
+  spark-master:
+    <<: *common
+    image: apache/spark:3.5.4
+    user: root
+    expose:
+      - "7077"
+      - "8080"
+    environment:
+      SERVICE_FQDN_SPARKMASTER_8080: ${SERVICE_FQDN_SPARKMASTER_8080}
+      # Enable event log so history-server can replay finished apps
+      SPARK_DAEMON_JAVA_OPTS: >-
+        -Dspark.eventLog.enabled=true
+        -Dspark.eventLog.dir=file:/opt/spark/events
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - 0.0.0.0
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    volumes:
+      - spark-events:/opt/spark/events
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ──────────────────────────────────────────────
+  # Worker 1 — 4 cores / 6GB
+  # ──────────────────────────────────────────────
+  spark-worker-1:
+    <<: *common
+    image: apache/spark:3.5.4
+    user: root
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    expose:
+      - "8081"
+    environment:
+      SPARK_WORKER_WEBUI_PORT: 8081
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8081"
+      - --cores
+      - "${SPARK_WORKER_CORES:-4}"
+      - --memory
+      - "${SPARK_WORKER_MEMORY:-6g}"
+      - spark://spark-master:7077
+    volumes:
+      - spark-events:/opt/spark/events
+
+  # ──────────────────────────────────────────────
+  # Worker 2 — duplicate to scale parallelism.
+  # To add more, copy this block; each needs a unique WebUI port.
+  # ──────────────────────────────────────────────
+  spark-worker-2:
+    <<: *common
+    image: apache/spark:3.5.4
+    user: root
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    expose:
+      - "8082"
+    environment:
+      SPARK_WORKER_WEBUI_PORT: 8082
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8082"
+      - --cores
+      - "${SPARK_WORKER_CORES:-4}"
+      - --memory
+      - "${SPARK_WORKER_MEMORY:-6g}"
+      - spark://spark-master:7077
+    volumes:
+      - spark-events:/opt/spark/events
+
+  # ──────────────────────────────────────────────
+  # History Server — replays completed apps from event logs.
+  # Public on SERVICE_FQDN_SPARKHISTORY_18080.
+  # ──────────────────────────────────────────────
+  spark-history:
+    <<: *common
+    image: apache/spark:3.5.4
+    user: root
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    expose:
+      - "18080"
+    environment:
+      SERVICE_FQDN_SPARKHISTORY_18080: ${SERVICE_FQDN_SPARKHISTORY_18080}
+      SPARK_HISTORY_OPTS: >-
+        -Dspark.history.fs.logDirectory=file:/opt/spark/events
+        -Dspark.history.ui.port=18080
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.history.HistoryServer
+    volumes:
+      - spark-events:/opt/spark/events
+
+volumes:
+  spark-events:

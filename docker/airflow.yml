@@ -1,0 +1,183 @@
+# Apache Airflow 2.10 (LocalExecutor) — Coolify Docker Compose
+# Usage:
+#   Local:   docker compose -f airflow.yml up -d
+#   Coolify: paste; set required env vars in UI. First boot runs airflow-init
+#            which creates DB schema + admin user, then exits.
+#
+# Topology (LocalExecutor — single-host homelab):
+#   postgres   — metadata DB
+#   init       — one-shot DB migrate + admin user create (exclude_from_hc)
+#   webserver  — UI (public via SERVICE_FQDN_AIRFLOW_8080)
+#   scheduler  — DAG parsing + executes tasks in subprocesses (no Celery)
+#   triggerer  — async deferrable operators
+#
+# LocalExecutor runs tasks as subprocesses of the scheduler — no Redis,
+# no Celery worker container. Scales by parallelism setting, not by adding
+# nodes. Right call for single-host (i9-9900K / 32GB) studies setup.
+
+x-common: &common
+  restart: unless-stopped
+
+# Shared Airflow env — every airflow-* service inherits this
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__FERNET_KEY: ${SERVICE_BASE64_AIRFLOWFERNET}
+  AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW_LOAD_EXAMPLES:-false}
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__CORE__PARALLELISM: ${AIRFLOW_PARALLELISM:-16}
+  AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW_MAX_ACTIVE_TASKS_PER_DAG:-16}
+
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${SERVICE_PASSWORD_AIRFLOWDB}@postgres:5432/airflow
+
+  AIRFLOW__WEBSERVER__SECRET_KEY: ${SERVICE_BASE64_AIRFLOWWEB}
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: ${AIRFLOW_EXPOSE_CONFIG:-false}
+
+  # Reverse-proxy (Coolify Traefik): trust X-Forwarded-* headers so the
+  # webserver builds https:// URLs and sets cookies with Secure flag.
+  # Without ProxyFix the browser gets http:// redirects → CSRF token
+  # mismatch on POST /login.
+  AIRFLOW__WEBSERVER__BASE_URL: https://${SERVICE_FQDN_AIRFLOW_8080}
+  AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX: "True"
+  AIRFLOW__WEBSERVER__PROXY_FIX_X_FOR: 1
+  AIRFLOW__WEBSERVER__PROXY_FIX_X_PROTO: 1
+  AIRFLOW__WEBSERVER__PROXY_FIX_X_HOST: 1
+  AIRFLOW__WEBSERVER__PROXY_FIX_X_PORT: 1
+  AIRFLOW__WEBSERVER__PROXY_FIX_X_PREFIX: 1
+  AIRFLOW__WEBSERVER__COOKIE_SECURE: "True"
+  AIRFLOW__WEBSERVER__COOKIE_SAMESITE: Lax
+
+  AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+  AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+
+  # Extra pip packages installed at container start (comma-separated).
+  # For prod, build a custom image instead — installing on every restart
+  # hits PyPI and slows boot.
+  _PIP_ADDITIONAL_REQUIREMENTS: ${AIRFLOW_PIP_REQUIREMENTS:-}
+
+x-airflow-common: &airflow-common
+  <<: *common
+  image: apache/airflow:2.10.4-python3.12
+  user: "50000:0"
+  environment:
+    <<: *airflow-env
+  volumes:
+    - airflow-dags:/opt/airflow/dags
+    - airflow-logs:/opt/airflow/logs
+    - airflow-plugins:/opt/airflow/plugins
+    - airflow-config:/opt/airflow/config
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  # ──────────────────────────────────────────────
+  # Postgres — Airflow metadata DB
+  # ──────────────────────────────────────────────
+  postgres:
+    <<: *common
+    image: postgres:16-alpine
+    expose:
+      - "5432"
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_AIRFLOWDB}
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ──────────────────────────────────────────────
+  # Init — one-shot: db migrate + create admin user
+  # Excluded from health check; runs once and exits.
+  # ──────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    restart: "no"
+    exclude_from_hc: true
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate && \
+        airflow users create \
+          --username "$${_AIRFLOW_WWW_USER_USERNAME}" \
+          --password "$${_AIRFLOW_WWW_USER_PASSWORD}" \
+          --firstname Admin --lastname User \
+          --role Admin --email "$${_AIRFLOW_WWW_USER_EMAIL}" || true
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${SERVICE_PASSWORD_AIRFLOWADMIN}
+      _AIRFLOW_WWW_USER_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@localhost}
+
+  # ──────────────────────────────────────────────
+  # Webserver — Airflow UI (public)
+  # ──────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    expose:
+      - "8080"
+    environment:
+      <<: *airflow-env
+      SERVICE_FQDN_AIRFLOW_8080: ${SERVICE_FQDN_AIRFLOW_8080}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ──────────────────────────────────────────────
+  # Scheduler — parses DAGs, runs tasks as subprocesses (LocalExecutor)
+  # ──────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ──────────────────────────────────────────────
+  # Triggerer — runs async deferrable operators
+  # ──────────────────────────────────────────────
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type TriggererJob --hostname \"$${HOSTNAME}\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  airflow-postgres:
+  airflow-dags:
+  airflow-logs:
+  airflow-plugins:
+  airflow-config:
